@@ -62,24 +62,23 @@ Here is the descriptions of images in the Current post.
 ` + messageCompletionFooter;
 
 export const twitterShouldRespondTemplate = (targetUsersStr: string) =>
-    `# INSTRUCTIONS: Determine if {{agentName}} (@{{twitterUserName}}) should respond to the message and participate in the conversation. Do not comment. Just respond with "true" or "false".
+    `# INSTRUCTIONS: Determine if {{agentName}} (@{{twitterUserName}}) should respond to the message and participate in the conversation.
 
 Response options are RESPOND, IGNORE and STOP.
 
 PRIORITY RULE: ALWAYS RESPOND to these users regardless of topic or message content: ${targetUsersStr}. Topic relevance should be ignored for these users.
 
 For other users:
+- {{agentName}} should ALWAYS RESPOND to direct mentions (@mentions)
 - {{agentName}} should RESPOND to messages directed at them
 - {{agentName}} should RESPOND to conversations relevant to their background
 - {{agentName}} should IGNORE irrelevant messages
-- {{agentName}} should IGNORE very short messages unless directly addressed
 - {{agentName}} should STOP if asked to stop
 - {{agentName}} should STOP if conversation is concluded
-- {{agentName}} is in a room with other users and wants to be conversational, but not annoying.
 
 IMPORTANT:
-- {{agentName}} (aka @{{twitterUserName}}) is particularly sensitive about being annoying, so if there is any doubt, it is better to IGNORE than to RESPOND.
-- For users not in the priority list, {{agentName}} (@{{twitterUserName}}) should err on the side of IGNORE rather than RESPOND if in doubt.
+- For direct mentions (@mentions), {{agentName}} should RESPOND unless there's a clear reason not to
+- For other interactions, if in doubt, evaluate based on relevance to character's background
 
 Recent Posts:
 {{recentPosts}}
@@ -120,11 +119,11 @@ export class TwitterInteractionClient {
 
         const twitterUsername = this.client.profile.username;
         try {
-            // Check for mentions
+            // Check for mentions with improved search query
             const mentionCandidates = (
                 await this.client.fetchSearchTweets(
-                    `@${twitterUsername}`,
-                    20,
+                    `@${twitterUsername} OR to:${twitterUsername}`,
+                    50, // Increased from 20 to 50
                     SearchMode.Latest
                 )
             ).tweets;
@@ -156,7 +155,7 @@ export class TwitterInteractionClient {
                                 )
                             ).tweets;
 
-                            // Filter for unprocessed, non-reply, recent tweets
+                            // Modified tweet filtering to be more inclusive
                             const validTweets = userTweets.filter((tweet) => {
                                 const isUnprocessed =
                                     !this.client.lastCheckedTweetId ||
@@ -164,19 +163,21 @@ export class TwitterInteractionClient {
                                         this.client.lastCheckedTweetId;
                                 const isRecent =
                                     Date.now() - tweet.timestamp * 1000 <
-                                    2 * 60 * 60 * 1000;
+                                    24 * 60 * 60 * 1000; // Increased to 24 hours
+
+                                const isMention = tweet.text?.includes(`@${twitterUsername}`);
 
                                 elizaLogger.log(`Tweet ${tweet.id} checks:`, {
                                     isUnprocessed,
                                     isRecent,
                                     isReply: tweet.isReply,
                                     isRetweet: tweet.isRetweet,
+                                    isMention
                                 });
 
                                 return (
                                     isUnprocessed &&
-                                    !tweet.isReply &&
-                                    !tweet.isRetweet &&
+                                    (isMention || (!tweet.isReply && !tweet.isRetweet)) &&
                                     isRecent
                                 );
                             });
@@ -198,7 +199,7 @@ export class TwitterInteractionClient {
 
                     // Select one tweet from each user that has tweets
                     const selectedTweets: Tweet[] = [];
-                    for (const [username, tweets] of tweetsByUser) {
+                    for (const [username, tweets] of Array.from(tweetsByUser)) {
                         if (tweets.length > 0) {
                             // Randomly select one tweet from this user
                             const randomTweet =
@@ -567,6 +568,12 @@ export class TwitterInteractionClient {
         const thread: Tweet[] = [];
         const visited: Set<string> = new Set();
 
+        // Always include the original tweet if it's a mention
+        if (tweet.text?.includes(`@${this.client.profile.username}`)) {
+            thread.push(tweet);
+            visited.add(tweet.id);
+        }
+
         async function processThread(currentTweet: Tweet, depth = 0) {
             elizaLogger.log("Processing tweet:", {
                 id: currentTweet.id,
@@ -588,47 +595,6 @@ export class TwitterInteractionClient {
             const memory = await this.runtime.messageManager.getMemoryById(
                 stringToUuid(currentTweet.id + "-" + this.runtime.agentId)
             );
-            if (!memory) {
-                const roomId = stringToUuid(
-                    currentTweet.conversationId + "-" + this.runtime.agentId
-                );
-                const userId = stringToUuid(currentTweet.userId);
-
-                await this.runtime.ensureConnection(
-                    userId,
-                    roomId,
-                    currentTweet.username,
-                    currentTweet.name,
-                    "twitter"
-                );
-
-                this.runtime.messageManager.createMemory({
-                    id: stringToUuid(
-                        currentTweet.id + "-" + this.runtime.agentId
-                    ),
-                    agentId: this.runtime.agentId,
-                    content: {
-                        text: currentTweet.text,
-                        source: "twitter",
-                        url: currentTweet.permanentUrl,
-                        imageUrls: currentTweet.photos?.map(photo => photo.url) || [],
-                        inReplyTo: currentTweet.inReplyToStatusId
-                            ? stringToUuid(
-                                  currentTweet.inReplyToStatusId +
-                                      "-" +
-                                      this.runtime.agentId
-                              )
-                            : undefined,
-                    },
-                    createdAt: currentTweet.timestamp * 1000,
-                    roomId,
-                    userId:
-                        currentTweet.userId === this.twitterUserId
-                            ? this.runtime.agentId
-                            : stringToUuid(currentTweet.userId),
-                    embedding: getEmbeddingZeroVector(),
-                });
-            }
 
             if (visited.has(currentTweet.id)) {
                 elizaLogger.log("Already visited tweet:", currentTweet.id);
